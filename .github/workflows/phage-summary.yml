@@ -12,7 +12,8 @@ on:
       query:
         description: "NCBI search query (if mode=search)"
         required: false
-        default: bacteriophage complete genome[Title] AND srcdb_refseq[PROP] AND biomol_genomic[PROP] AND 10000:100000[SLEN]
+        # IMPORTANT: quoted so YAML parses (colon inside the string)
+        default: "bacteriophage complete genome[Title] AND srcdb_refseq[PROP] AND biomol_genomic[PROP] AND 10000:100000[SLEN]"
       max_hits:
         description: "Max hits for search (mode=search)"
         required: false
@@ -59,7 +60,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          set -f  # keep [Title]/[SLEN]/[PROP] from globbing
+          set -f  # prevent [Title]/[SLEN]/[PROP] from globbing
           mkdir -p "${{ inputs.save_dir }}"
 
           CSV_OUT="summary.csv"
@@ -98,27 +99,6 @@ jobs:
           echo "Running: ${CMD[*]}"
           if "${CMD[@]}"; then echo "status=0" >> $GITHUB_OUTPUT; else echo "status=$?" >> $GITHUB_OUTPUT; fi
 
-      - name: Rename UID .gbk files to accessions (post-search tidy)
-        if: ${{ always() && inputs.mode == 'search' }}
-        shell: bash
-        run: |
-          python - << 'PY'
-          import os, glob
-          from Bio import SeqIO
-          bank_dir = "${{ inputs.save_dir }}"
-          os.makedirs(bank_dir, exist_ok=True)
-          for path in glob.glob(os.path.join(bank_dir, "*.gbk")):
-            try:
-              rec = next(SeqIO.parse(path, "genbank"))
-            except Exception:
-              continue
-            acc = (rec.id.split('.')[0] if rec.id else "") or rec.name
-            if not acc: continue
-            new = os.path.join(bank_dir, f"{acc}.gbk")
-            if os.path.abspath(new) != os.path.abspath(path) and not os.path.exists(new):
-              os.rename(path, new)
-          PY
-
       - name: Preview CSV in job summary
         if: always()
         shell: bash
@@ -147,13 +127,6 @@ jobs:
               echo "_No summary.csv produced_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Debug: list workspace
-        if: always()
-        shell: bash
-        run: |
-          echo "---- ls -lah ----"; ls -lah
-          echo "---- bank/ ----"; ls -lah "${{ inputs.save_dir }}" || true
 
       - name: Upload artifacts (unique per run)
         if: always()
