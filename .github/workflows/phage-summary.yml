@@ -1,0 +1,122 @@
+name: Phage/Virome Summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "How to provide data"
+        required: true
+        type: choice
+        default: search
+        options: [search, accessions, local_only]
+      query:
+        description: "NCBI search query (if mode=search)"
+        required: false
+        default: '"bacteriophage complete genome"[Title] AND srcdb_refseq[PROP] AND 10000:100000[SLEN]'
+      max_hits:
+        description: "Max hits for search (mode=search)"
+        required: false
+        default: "10"
+      accessions:
+        description: "Space-separated list (mode=accessions)"
+        required: false
+        default: "NC_001416"
+      save_dir:
+        description: "Cache/download folder"
+        required: true
+        default: "bank"
+      filter_to_phage:
+        description: "Filter to phage/virome"
+        required: true
+        type: choice
+        default: "true"
+        options: ["true", "false"]
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install biopython
+
+      - name: Run summary
+        env:
+          ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ inputs.save_dir }}"
+
+          CSV_OUT="summary.csv"
+          JSON_OUT="summary.json"
+          HYPO_OUT="hypotheticals.txt"
+
+          CMD=( python parse_genbank_phage_virome_fetch_cached.py
+                --save-dir "./${{ inputs.save_dir }}"
+                --csv "$CSV_OUT"
+                --json "$JSON_OUT"
+                --list-hypo "$HYPO_OUT" )
+
+          # filter flag
+          if [[ "${{ inputs.filter_to_phage }}" == "false" ]]; then
+            CMD+=( --no-filter )
+          fi
+
+          # secrets (email required for remote fetch)
+          if [[ -n "${ENTREZ_EMAIL:-}" ]]; then
+            CMD+=( --entrez-email "$ENTREZ_EMAIL" )
+          fi
+          if [[ -n "${NCBI_API_KEY:-}" ]]; then
+            CMD+=( --api-key "$NCBI_API_KEY" )
+          fi
+
+          # choose mode
+          case "${{ inputs.mode }}" in
+            search)
+              # If user left query empty, use default from dispatch input.
+              QUERY='${{ inputs.query }}'
+              MAX_HITS='${{ inputs.max_hits }}'
+              CMD+=( --search "$QUERY" --max-hits "$MAX_HITS" )
+              ;;
+            accessions)
+              # Split the accessions string into words
+              read -r -a ACCS <<< '${{ inputs.accessions }}'
+              CMD+=( --acc "${ACCS[@]}" )
+              ;;
+            local_only)
+              # Use any *.gb / *.gbk in repo root
+              FILES=( *.gb *.gbk )
+              shopt -s nullglob
+              if (( ${#FILES[@]} )); then
+                CMD+=( "${FILES[@]}" )
+              else
+                echo "No local .gb/.gbk files found. Add some or use 'search'/'accessions' mode."
+                exit 2
+              fi
+              ;;
+          esac
+
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: phage-summary
+          path: |
+            summary.csv
+            summary.json
+            hypotheticals.txt
+            ${{ inputs.save_dir }}/
