@@ -12,7 +12,6 @@ on:
       query:
         description: "NCBI search query (if mode=search)"
         required: false
-        # shell-safe default (no inner quotes); includes genomic molecule filter
         default: bacteriophage complete genome[Title] AND srcdb_refseq[PROP] AND biomol_genomic[PROP] AND 10000:100000[SLEN]
       max_hits:
         description: "Max hits for search (mode=search)"
@@ -52,40 +51,33 @@ jobs:
           pip install biopython
 
       - name: Run summary
+        id: run_summary
         env:
           ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
           NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
         shell: bash
+        continue-on-error: true
         run: |
           set -euo pipefail
-          set -f  # disable pathname expansion so [Title]/[SLEN]/[PROP] aren't globbed
+          set -f  # keep [Title]/[SLEN]/[PROP] from globbing
           mkdir -p "${{ inputs.save_dir }}"
 
           CSV_OUT="summary.csv"
           JSON_OUT="summary.json"
           HYPO_OUT="hypotheticals.txt"
 
-          # Build base command in a bash array
           CMD=( python parse_genbank_phage_virome_fetch_cached.py
                 --save-dir "./${{ inputs.save_dir }}"
                 --csv "$CSV_OUT"
                 --json "$JSON_OUT"
                 --list-hypo "$HYPO_OUT" )
 
-          # Optional filter toggle
           if [[ "${{ inputs.filter_to_phage }}" == "false" ]]; then
             CMD+=( --no-filter )
           fi
+          [[ -n "${ENTREZ_EMAIL:-}" ]] && CMD+=( --entrez-email "$ENTREZ_EMAIL" )
+          [[ -n "${NCBI_API_KEY:-}" ]] && CMD+=( --api-key "$NCBI_API_KEY" )
 
-          # Secrets (email is required for remote fetch)
-          if [[ -n "${ENTREZ_EMAIL:-}" ]]; then
-            CMD+=( --entrez-email "$ENTREZ_EMAIL" )
-          fi
-          if [[ -n "${NCBI_API_KEY:-}" ]]; then
-            CMD+=( --api-key "$NCBI_API_KEY" )
-          fi
-
-          # Mode handling
           case "${{ inputs.mode }}" in
             search)
               QUERY='${{ inputs.query }}'
@@ -93,27 +85,21 @@ jobs:
               CMD+=( --search "$QUERY" --max-hits "$MAX_HITS" )
               ;;
             accessions)
-              # Split the space-separated string into an array safely
               read -r -a ACCS <<< '${{ inputs.accessions }}'
               CMD+=( --acc "${ACCS[@]}" )
               ;;
             local_only)
               shopt -s nullglob
               FILES=( *.gb *.gbk *.genbank )
-              if (( ${#FILES[@]} )); then
-                CMD+=( "${FILES[@]}" )
-              else
-                echo "No local .gb/.gbk/.genbank files found. Add some or use 'search'/'accessions' mode."
-                exit 2
-              fi
+              (( ${#FILES[@]} )) && CMD+=( "${FILES[@]}" ) || echo "No local GBK files found."
               ;;
           esac
 
           echo "Running: ${CMD[*]}"
-          "${CMD[@]}"
+          if "${CMD[@]}"; then echo "status=0" >> $GITHUB_OUTPUT; else echo "status=$?" >> $GITHUB_OUTPUT; fi
 
       - name: Rename UID .gbk files to accessions (post-search tidy)
-        if: ${{ inputs.mode == 'search' }}
+        if: ${{ always() && inputs.mode == 'search' }}
         shell: bash
         run: |
           python - << 'PY'
@@ -126,10 +112,8 @@ jobs:
               rec = next(SeqIO.parse(path, "genbank"))
             except Exception:
               continue
-            # Prefer accession without version; fall back to record.name or basename
-            acc = (rec.id.split('.')[0] if rec.id else "") or (rec.name or "")
-            if not acc:
-              continue
+            acc = (rec.id.split('.')[0] if rec.id else "") or rec.name
+            if not acc: continue
             new = os.path.join(bank_dir, f"{acc}.gbk")
             if os.path.abspath(new) != os.path.abspath(path) and not os.path.exists(new):
               os.rename(path, new)
@@ -149,8 +133,9 @@ jobs:
             elif [[ "${{ inputs.mode }}" == "accessions" ]]; then
               echo "**Accessions:** \`${{ inputs.accessions }}\`  "
             else
-              echo "**Local only**  "
+              echo "**Local files mode**  "
             fi
+            echo "**Parser exit code:** \`${{ steps.run_summary.outputs.status || 'unknown' }}\`  "
             echo
             if [[ -f summary.csv ]]; then
               echo "### First rows of \`summary.csv\`"
@@ -159,25 +144,26 @@ jobs:
               head -n 20 summary.csv
               echo '```'
             else
-              echo "_No CSV produced_"
+              echo "_No summary.csv produced_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts
+      - name: Debug: list workspace
+        if: always()
+        shell: bash
+        run: |
+          echo "---- ls -lah ----"; ls -lah
+          echo "---- bank/ ----"; ls -lah "${{ inputs.save_dir }}" || true
+
+      - name: Upload artifacts (unique per run)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phage-summary
+          name: phage-summary-${{ github.run_number }}
           path: |
             summary.csv
             summary.json
             hypotheticals.txt
             ${{ inputs.save_dir }}/
-          # keep artifacts for a week by default
+          if-no-files-found: warn
           retention-days: 7
-
-      - name: 🧹 Delete older artifacts with same name (keep newest)
-        uses: geekyeggo/delete-artifact@v5
-        with:
-          name: phage-summary
-          failOnError: false
-          skipWorkflowRunId: ${{ github.run_id }}
